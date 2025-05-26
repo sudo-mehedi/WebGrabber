@@ -94,16 +94,18 @@ if (isset($_GET['action']) && $_GET['action'] === 'getFileInfo' && isset($_GET['
     curl_setopt($ch, CURLOPT_HEADER, true);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 10); // Allow up to 10 redirects
     curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30); // Increased timeout for redirects
     
     $headers = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $contentLength = curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD);
     $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL); // Get the final URL after redirects
     curl_close($ch);
     
-    $filename = basename(parse_url($url, PHP_URL_PATH));
+    $filename = basename(parse_url($finalUrl, PHP_URL_PATH));
     if (empty($filename) || strpos($filename, '.') === false) {
         $filename = 'download_' . time();
     }
@@ -118,7 +120,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'getFileInfo' && isset($_GET['
         'filename' => $filename,
         'size' => $contentLength > 0 ? $contentLength : null,
         'type' => $contentType,
-        'httpCode' => $httpCode
+        'httpCode' => $httpCode,
+        'finalUrl' => $finalUrl // Include the final URL in the response
     ]);
     exit;
 }
@@ -167,22 +170,44 @@ if (isset($_GET['url'])) {
     function downloadFile($url, $path) {
         global $filename, $totalSize;
         
+        // First, get the final URL after redirects
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_NOBODY, true);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 10);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        curl_exec($ch);
+        $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        curl_close($ch);
+
+        // Now download using the final URL
         $fp = fopen($path, 'w+');
         if (!$fp) {
             sendProgress(0, 'Error', $filename, '', '', 'error');
             return false;
         }
         
-        $ch = curl_init($url);
+        $ch = curl_init($finalUrl);
         curl_setopt($ch, CURLOPT_FILE, $fp);
         curl_setopt($ch, CURLOPT_NOPROGRESS, false);
         curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, 'progress');
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 10);
         curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
         curl_setopt($ch, CURLOPT_TIMEOUT, 0);
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 30);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        
+        // Performance optimization settings
+        curl_setopt($ch, CURLOPT_BUFFERSIZE, 32768); // 32KB buffer size
+        curl_setopt($ch, CURLOPT_TCP_NODELAY, true); // Disable Nagle's algorithm
+        curl_setopt($ch, CURLOPT_ENCODING, ''); // Accept all supported encodings
+        curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1); // Use HTTP/1.1
+        curl_setopt($ch, CURLOPT_TCP_KEEPALIVE, 1); // Enable TCP keep-alive
+        curl_setopt($ch, CURLOPT_TCP_KEEPIDLE, 120); // Keep-alive idle time
+        curl_setopt($ch, CURLOPT_TCP_KEEPINTVL, 60); // Keep-alive interval
         
         $result = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -221,7 +246,7 @@ if (isset($_GET['url'])) {
             } else {
                 $timeDiff = $currentTime - $lastTime;
                 
-                // Update speed calculation every 0.5 seconds
+                // Update speed calculation every 0.5 seconds to reduce overhead
                 if ($timeDiff >= 0.5) {
                     $bytesDownloaded = $downloaded - $lastDownloadedSize;
                     $speedBps = $bytesDownloaded / $timeDiff;
@@ -252,21 +277,16 @@ if (isset($_GET['url'])) {
                     // Update values for next calculation
                     $lastTime = $currentTime;
                     $lastDownloadedSize = $downloaded;
-                } else {
-                    // Use previous speed calculation
-                    $speed = null; // This will prevent sending redundant updates
+                    
+                    // Only send progress updates when speed changes
+                    sendProgress(
+                        $percentage, 
+                        $speed, 
+                        $filename, 
+                        formatFileSize($totalSize),
+                        formatFileSize($downloaded)
+                    );
                 }
-            }
-            
-            // Only send updates when we have a speed to report or for percentage updates
-            if ($speed !== null) {
-                sendProgress(
-                    $percentage, 
-                    $speed, 
-                    $filename, 
-                    formatFileSize($totalSize),
-                    formatFileSize($downloaded)
-                );
             }
         }
     }
@@ -548,6 +568,7 @@ if (isset($_GET['url'])) {
                     <div class="alert alert-success">
                         <i class="bi bi-check-circle"></i> <strong>Valid URL</strong><br>
                         <small>File: ${data.filename} ${data.size ? `(${formatFileSize(data.size)})` : ''}</small>
+                        ${data.finalUrl && data.finalUrl !== data.url ? `<br><small>Final URL: ${data.finalUrl}</small>` : ''}
                     </div>
                 `;
                 document.getElementById('addToQueueBtn').disabled = false;
